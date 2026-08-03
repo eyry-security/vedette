@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use vedette::input::{self, Source};
 use vedette::probe::{probe, ProbeOptions};
+use vedette::resolver::Dns;
 
 /// Fast, multi-threaded HTTP prober. Reads hosts from a file, stdin, or a Redis
 /// queue, probes them concurrently, and writes one JSON record per host.
@@ -84,12 +85,17 @@ async fn main() -> Result<()> {
         max_body: args.max_body,
     });
 
+    // One shared async resolver, used for the ips field and for connecting.
+    let dns = Dns::new();
+
     let client = Arc::new(
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(args.timeout))
             .connect_timeout(Duration::from_secs(args.timeout))
             .redirect(reqwest::redirect::Policy::limited(10))
+            .pool_max_idle_per_host(0)
+            .dns_resolver(Arc::new(dns.clone()))
             .user_agent(concat!("vedette/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build HTTP client")?,
@@ -127,6 +133,7 @@ async fn main() -> Result<()> {
             None => Box::new(tokio::io::stdout()),
         };
         let mut buf = BufWriter::new(&mut out);
+        let mut since_flush = 0u32;
         while let Some(result) = res_rx.recv().await {
             wtotal.fetch_add(1, Ordering::Relaxed);
             if result.ok {
@@ -135,7 +142,12 @@ async fn main() -> Result<()> {
             let line = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
             buf.write_all(line.as_bytes()).await?;
             buf.write_all(b"\n").await?;
-            buf.flush().await?;
+            // Batch flushes: per-line flush is a syscall per host and kills throughput.
+            since_flush += 1;
+            if since_flush >= 32 {
+                buf.flush().await?;
+                since_flush = 0;
+            }
         }
         buf.flush().await?;
         Ok::<(), anyhow::Error>(())
@@ -149,10 +161,11 @@ async fn main() -> Result<()> {
     ReceiverStream::new(host_rx)
         .for_each_concurrent(concurrency, |host| {
             let client = client.clone();
+            let dns = dns.clone();
             let opts = opts.clone();
             let res_tx = res_tx.clone();
             async move {
-                let result = probe(client, &host, &opts).await;
+                let result = probe(client, &dns, &host, &opts).await;
                 let _ = res_tx.send(result).await;
             }
         })

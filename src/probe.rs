@@ -1,10 +1,12 @@
 //! Probing logic: turn an input host into a [`ProbeResult`].
 
 use crate::model::ProbeResult;
+use aho_corasick::AhoCorasick;
 use futures::StreamExt;
 use regex::Regex;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -119,8 +121,35 @@ fn clean_header(value: &str) -> Option<String> {
     Some(v.chars().take(120).collect())
 }
 
-/// Best-effort tech fingerprint from headers and a body snippet.
-fn detect_tech(server: Option<&str>, powered_by: Option<&str>, body: &str) -> Vec<String> {
+/// Body markers → tech name, compiled once into a case-insensitive automaton.
+const MARKERS: &[(&str, &str)] = &[
+    ("wp-content", "WordPress"),
+    ("/_next/", "Next.js"),
+    ("__nuxt", "Nuxt.js"),
+    ("ng-version", "Angular"),
+    ("drupal-settings-json", "Drupal"),
+    ("joomla", "Joomla"),
+    ("x-shopify", "Shopify"),
+    ("grafana", "Grafana"),
+    ("kibana", "Kibana"),
+    ("phpmyadmin", "phpMyAdmin"),
+    ("jenkins", "Jenkins"),
+    ("swagger-ui", "Swagger"),
+];
+
+fn tech_matcher() -> &'static AhoCorasick {
+    static AC: OnceLock<AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(MARKERS.iter().map(|(needle, _)| *needle))
+            .expect("valid patterns")
+    })
+}
+
+/// Best-effort tech fingerprint from headers and the (raw) body bytes.
+/// Single case-insensitive pass over the body, no lowercase allocation.
+fn detect_tech(server: Option<&str>, powered_by: Option<&str>, body: &[u8]) -> Vec<String> {
     let mut tech = Vec::new();
     if let Some(s) = server {
         tech.push(s.to_string());
@@ -130,41 +159,16 @@ fn detect_tech(server: Option<&str>, powered_by: Option<&str>, body: &str) -> Ve
             tech.push(p.to_string());
         }
     }
-    let lower = body.to_lowercase();
-    let markers = [
-        ("wp-content", "WordPress"),
-        ("/_next/", "Next.js"),
-        ("__nuxt", "Nuxt.js"),
-        ("ng-version", "Angular"),
-        ("drupal-settings-json", "Drupal"),
-        ("joomla", "Joomla"),
-        ("x-shopify", "Shopify"),
-        ("grafana", "Grafana"),
-        ("kibana", "Kibana"),
-        ("phpmyadmin", "phpMyAdmin"),
-        ("jenkins", "Jenkins"),
-        ("swagger-ui", "Swagger"),
-    ];
-    for (needle, name) in markers {
-        if lower.contains(needle) && !tech.iter().any(|t| t == name) {
-            tech.push(name.to_string());
+    let matched: HashSet<usize> = tech_matcher()
+        .find_iter(body)
+        .map(|m| m.pattern().as_usize())
+        .collect();
+    for (idx, (_, name)) in MARKERS.iter().enumerate() {
+        if matched.contains(&idx) && !tech.iter().any(|t| t == name) {
+            tech.push((*name).to_string());
         }
     }
     tech
-}
-
-/// Resolve a host to a deduped list of IP strings (best effort). Port is
-/// irrelevant to the A/AAAA records; any value works.
-async fn resolve_ips(host: &str) -> Vec<String> {
-    match tokio::net::lookup_host((host, 443)).await {
-        Ok(addrs) => {
-            let mut ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-            ips.sort();
-            ips.dedup();
-            ips
-        }
-        Err(_) => Vec::new(),
-    }
 }
 
 fn build_url(scheme: &str, host: &str, port: u16) -> String {
@@ -246,9 +250,11 @@ async fn attempt_one(
     hasher.update(&body);
     let body_sha256 = hex::encode(hasher.finalize());
 
-    let body_str = String::from_utf8_lossy(&body);
-    let title = extract_title(&body_str);
-    let tech = detect_tech(server.as_deref(), powered_by.as_deref(), &body_str);
+    // Title lives in <head>; scan a generous prefix (covers heavy heads like
+    // GitHub) without decoding the whole capped body to UTF-8.
+    let head = &body[..body.len().min(128 * 1024)];
+    let title = extract_title(&String::from_utf8_lossy(head));
+    let tech = detect_tech(server.as_deref(), powered_by.as_deref(), &body);
 
     let redirected =
         final_url.host_str() != Some(host) || final_url.scheme() != scheme || final_url.path() != "/";
@@ -278,12 +284,20 @@ async fn attempt_one(
 /// Probe a single input host. For a bare host with two schemes, https and http
 /// are raced concurrently: https is preferred, http runs in parallel so http-only
 /// and dead hosts don't pay a second serial timeout.
-pub async fn probe(client: Arc<Client>, input: &str, opts: &ProbeOptions) -> ProbeResult {
+pub async fn probe(
+    client: Arc<Client>,
+    dns: &crate::resolver::Dns,
+    input: &str,
+    opts: &ProbeOptions,
+) -> ProbeResult {
     let target = parse_input(input, &opts.schemes);
 
-    // Resolve IPs concurrently with the probing.
-    let host_for_dns = target.host.clone();
-    let dns = tokio::spawn(async move { resolve_ips(&host_for_dns).await });
+    // Resolve first. No records → no point attempting HTTP (saves connect timeouts
+    // on stale/dead hosts). reqwest reuses this resolver's cache when connecting.
+    let ips = dns.lookup(&target.host).await;
+    if ips.is_empty() {
+        return ProbeResult::failed(input, &target.host, "dns: no records");
+    }
 
     let retries = opts.retries;
     let max_body = opts.max_body;
@@ -331,6 +345,6 @@ pub async fn probe(client: Arc<Client>, input: &str, opts: &ProbeOptions) -> Pro
         }
     };
 
-    result.ips = dns.await.unwrap_or_default();
+    result.ips = ips;
     result
 }

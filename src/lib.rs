@@ -9,6 +9,8 @@
 pub mod input;
 pub mod model;
 pub mod probe;
+pub mod resolver;
 
 pub use model::ProbeResult;
 pub use probe::{probe, ProbeOptions};
+pub use resolver::Dns;

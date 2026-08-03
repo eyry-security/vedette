@@ -86,6 +86,8 @@ Notes:
 - The body is streamed and cut off at `--max-body` (default 512 KB), so Vedette never downloads a
   huge page. `body_sha256` and, when there is no `Content-Length` header, `content_length` reflect
   the bytes actually read.
+- DNS uses a shared async resolver (public resolvers, both A and AAAA). A host that resolves to
+  nothing is reported immediately as failed without wasting HTTP attempts.
 
 ## As a library
 
