@@ -46,7 +46,8 @@ Inputs may be bare hosts (`admin.example.com`), `host:port`, or full URLs
 | `-o, --output <FILE>` | stdout | Write JSONL results here |
 | `-c, --concurrency <N>` | `50` | Concurrent probes |
 | `-t, --timeout <SECS>` | `10` | Per-request timeout |
-| `--retries <N>` | `1` | Retries per scheme |
+| `--retries <N>` | `1` | Retries per scheme after the first attempt |
+| `--max-body <BYTES>` | `524288` | Stop reading each body after N bytes (0 = unlimited) |
 | `--https-only` / `--http-only` | – | Restrict schemes |
 | `--silent` | – | Suppress the stderr summary |
 
@@ -78,6 +79,13 @@ suite speaks, so Vedette output flows straight into a queue or scanner.
 
 Hosts that do not respond are still emitted, with `"ok": false` and an `error` field, so nothing
 is silently dropped.
+
+Notes:
+- For a bare host, https and http are probed **concurrently** (https wins); http-only and dead
+  hosts don't pay a second serial timeout.
+- The body is streamed and cut off at `--max-body` (default 512 KB), so Vedette never downloads a
+  huge page. `body_sha256` and, when there is no `Content-Length` header, `content_length` reflect
+  the bytes actually read.
 
 ## As a library
 

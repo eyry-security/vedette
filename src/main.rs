@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     retries: u32,
 
+    /// Stop reading each body after this many bytes (0 = unlimited).
+    #[arg(long, default_value_t = 512 * 1024)]
+    max_body: usize,
+
     /// Only probe https.
     #[arg(long, conflicts_with = "http_only")]
     https_only: bool,
@@ -77,7 +81,7 @@ async fn main() -> Result<()> {
     let opts = Arc::new(ProbeOptions {
         schemes,
         retries: args.retries,
-        max_body: 2 * 1024 * 1024,
+        max_body: args.max_body,
     });
 
     let client = Arc::new(
@@ -148,7 +152,7 @@ async fn main() -> Result<()> {
             let opts = opts.clone();
             let res_tx = res_tx.clone();
             async move {
-                let result = probe(&client, &host, &opts).await;
+                let result = probe(client, &host, &opts).await;
                 let _ = res_tx.send(result).await;
             }
         })
