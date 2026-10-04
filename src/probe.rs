@@ -1,15 +1,19 @@
 //! Probing logic: turn an input host into a [`ProbeResult`].
 
-use crate::model::ProbeResult;
+use crate::model::{ProbeResult, TlsCertificate};
 use aho_corasick::AhoCorasick;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use regex::Regex;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use x509_parser::extensions::GeneralName;
+use x509_parser::parse_x509_certificate;
 
 /// Options that shape how each host is probed.
 #[derive(Clone)]
@@ -179,6 +183,57 @@ fn build_url(scheme: &str, host: &str, port: u16) -> String {
     }
 }
 
+fn format_cert_time(timestamp: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn format_san(name: &GeneralName<'_>) -> Option<String> {
+    match name {
+        GeneralName::DNSName(value)
+        | GeneralName::RFC822Name(value)
+        | GeneralName::URI(value) => Some((*value).to_string()),
+        GeneralName::IPAddress(bytes) => match bytes.len() {
+            4 => Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()),
+            16 => {
+                let octets: [u8; 16] = (*bytes).try_into().ok()?;
+                Some(Ipv6Addr::from(octets).to_string())
+            }
+            _ => None,
+        },
+        GeneralName::DirectoryName(value) => Some(value.to_string()),
+        GeneralName::RegisteredID(value) => Some(value.to_id_string()),
+        _ => None,
+    }
+}
+
+/// Parse useful, non-secret metadata from a DER-encoded leaf certificate.
+fn parse_tls_certificate(der: &[u8]) -> Option<TlsCertificate> {
+    let (_, certificate) = parse_x509_certificate(der).ok()?;
+    let validity = certificate.validity();
+    let sans = certificate
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|extension| {
+            extension
+                .value
+                .general_names
+                .iter()
+                .filter_map(format_san)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(TlsCertificate {
+        subject: certificate.subject().to_string(),
+        issuer: certificate.issuer().to_string(),
+        sans,
+        valid_from: format_cert_time(validity.not_before.timestamp())?,
+        expires_at: format_cert_time(validity.not_after.timestamp())?,
+    })
+}
+
 /// Attempt one scheme/port. Returns a full [`ProbeResult`] (minus `ips`, filled
 /// by the caller) on any HTTP response, or an error string if it never responded.
 async fn attempt_one(
@@ -209,6 +264,11 @@ async fn attempt_one(
 
     let status = resp.status().as_u16();
     let final_url = resp.url().clone();
+    let tls = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .and_then(parse_tls_certificate);
 
     let header = |name: &str| -> Option<String> {
         resp.headers()
@@ -266,6 +326,7 @@ async fn attempt_one(
         scheme: Some(scheme.to_string()),
         host: host.to_string(),
         port: Some(port),
+        tls,
         status: Some(status),
         title,
         server,
@@ -347,4 +408,38 @@ pub async fn probe(
 
     result.ips = ips;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tls_certificate;
+
+    #[test]
+    fn parses_structured_tls_certificate_details() {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(include_bytes!(
+            "../tests/fixtures/tls-cert.pem"
+        ))
+        .expect("valid PEM fixture");
+
+        let details = parse_tls_certificate(&pem.contents).expect("valid DER certificate");
+        let json = serde_json::to_value(&details).expect("serializable TLS details");
+
+        assert!(details.subject.contains("O=Eyry Test"));
+        assert!(details.subject.contains("CN=example.test"));
+        assert_eq!(details.issuer, details.subject);
+        assert_eq!(json["subject"].as_str(), Some(details.subject.as_str()));
+        assert_eq!(json["issuer"].as_str(), Some(details.issuer.as_str()));
+        assert_eq!(
+            details.sans,
+            ["example.test", "*.example.test", "192.0.2.1"]
+        );
+        assert_eq!(json["sans"][0], "example.test");
+        assert_eq!(details.valid_from, "2026-10-04T11:04:59Z");
+        assert_eq!(details.expires_at, "2036-10-01T11:04:59Z");
+    }
+
+    #[test]
+    fn rejects_malformed_tls_certificate() {
+        assert!(parse_tls_certificate(b"not a DER certificate").is_none());
+    }
 }

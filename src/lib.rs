@@ -11,6 +11,6 @@ pub mod model;
 pub mod probe;
 pub mod resolver;
 
-pub use model::ProbeResult;
+pub use model::{ProbeResult, TlsCertificate};
 pub use probe::{probe, ProbeOptions};
 pub use resolver::Dns;

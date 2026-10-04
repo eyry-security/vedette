@@ -5,6 +5,25 @@
 
 use serde::Serialize;
 
+/// Structured metadata from the leaf certificate presented by an HTTPS service.
+#[derive(Debug, Clone, Serialize)]
+pub struct TlsCertificate {
+    /// Distinguished name of the certificate subject.
+    pub subject: String,
+
+    /// Distinguished name of the certificate issuer.
+    pub issuer: String,
+
+    /// Subject Alternative Name values (DNS names, IPs, email addresses, and URIs).
+    pub sans: Vec<String>,
+
+    /// Start of the certificate validity window, as RFC 3339 UTC.
+    pub valid_from: String,
+
+    /// End of the certificate validity window, as RFC 3339 UTC.
+    pub expires_at: String,
+}
+
 /// The result of probing one input host.
 ///
 /// Serialized as a single line of JSON (JSONL) so results stream and pipe cleanly.
@@ -27,6 +46,10 @@ pub struct ProbeResult {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+
+    /// Leaf certificate details when the response was served over TLS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsCertificate>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
@@ -81,6 +104,7 @@ impl ProbeResult {
             scheme: None,
             host: host.to_string(),
             port: None,
+            tls: None,
             status: None,
             title: None,
             server: None,

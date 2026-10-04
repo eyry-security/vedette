@@ -10,7 +10,7 @@ boat sent ahead of the fleet.
 - Takes hosts from a file, stdin, or a Redis queue (streaming `BRPOP`) and
   probes them concurrently (default 50).
 - For each host: status code, title, server header, tech fingerprint,
-  resolved IPs, body hash, response time.
+  resolved IPs, TLS leaf-certificate details, body hash, response time.
 - Writes one JSON object per line (JSONL) — the shared host/service schema the
   rest of the suite speaks, so output flows straight into a queue or scanner.
 - Dead hosts are still emitted, with `"ok": false` and an `error` field — so
@@ -86,6 +86,13 @@ $ echo 'eyry.io' | vedette --silent
   "scheme": "https",
   "host": "eyry.io",
   "port": 443,
+  "tls": {
+    "subject": "CN=www.eyry.io",
+    "issuer": "C=US, O=Let's Encrypt, CN=R13",
+    "sans": ["eyry.io", "www.eyry.io"],
+    "valid_from": "2026-09-18T08:42:10Z",
+    "expires_at": "2026-12-17T08:42:09Z"
+  },
   "status": 200,
   "title": "Eyry — The AppSec Pipeline: Build, Break, Harden, Watch",
   "server": "Vercel",
@@ -104,6 +111,9 @@ Notes:
 
 - For a bare host, https and http are probed **concurrently** (https wins); the
   scheme can also be pinned with `--https-only` / `--http-only`.
+- HTTPS responses include the leaf certificate under `tls`: subject, issuer,
+  SAN values, and RFC 3339 `valid_from` / `expires_at` timestamps. Plain HTTP
+  responses omit the field.
 - The body is streamed and cut off at `--max-body` (default 512 KB), so Vedette
   never downloads a huge page. `body_sha256` and, when there is no
   `Content-Length` header, `content_length` reflect the bytes actually read.
@@ -122,7 +132,12 @@ use vedette::resolver::Dns;
 
 #[tokio::main]
 async fn main() {
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .tls_info(true)
+            .build()
+            .unwrap(),
+    );
     let dns = Dns::new();
     let result = probe(client, &dns, "example.com", &ProbeOptions::default()).await;
     println!("{}", serde_json::to_string(&result).unwrap());
@@ -150,7 +165,6 @@ and at scale — nothing downstream runs on guesses.
 - **quarterdeck**: agent control plane — scheduler, wake/sleep, identity and memory, IRC-style chat, ChatOps, pipeline orchestration
 ## Roadmap
 
-- TLS certificate details (subject/issuer/SAN/expiry) as structured fields
 - Preserve request paths for full-URL inputs
 - Custom ports and port lists
 - Optional CSV / plain output

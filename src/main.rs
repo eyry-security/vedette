@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
     let client = Arc::new(
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .tls_info(true)
             .timeout(Duration::from_secs(args.timeout))
             .connect_timeout(Duration::from_secs(args.timeout))
             .redirect(reqwest::redirect::Policy::limited(10))

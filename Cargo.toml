@@ -33,6 +33,9 @@ hex = "0.4"
 regex = "1"
 aho-corasick = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+x509-parser = "=0.16.0"
+# Keep x509-parser's time dependency compatible with the documented Rust 1.70 minimum.
+time = "=0.3.36"
 
 [profile.release]
 opt-level = 3
