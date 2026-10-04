@@ -13,11 +13,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use vedette::input::{self, Source};
+use vedette::output::{render_result, OutputFormat};
 use vedette::probe::{probe, ProbeOptions};
 use vedette::resolver::Dns;
 
 /// Fast, multi-threaded HTTP prober. Reads hosts from a file, stdin, or a Redis
-/// queue, probes them concurrently, and writes one JSON record per host.
+/// queue, probes them concurrently, and streams the results.
 #[derive(Parser, Debug)]
 #[command(name = "vedette", version, about)]
 struct Args {
@@ -34,9 +35,13 @@ struct Args {
     #[arg(long, default_value = "vedette:hosts")]
     queue: String,
 
-    /// Output file for JSONL results (default: stdout).
+    /// Output file for results (default: stdout).
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// Output responding URLs only, one per line; failed probes are omitted.
+    #[arg(long, alias = "urls")]
+    url_only: bool,
 
     /// Number of concurrent probes.
     #[arg(short = 'c', long, default_value_t = 50)]
@@ -121,6 +126,11 @@ async fn main() -> Result<()> {
 
     // Writer task owns the output and serializes all writes.
     let output = args.output.clone();
+    let output_format = if args.url_only {
+        OutputFormat::Urls
+    } else {
+        OutputFormat::JsonLines
+    };
     let ok_count = Arc::new(AtomicU64::new(0));
     let total_count = Arc::new(AtomicU64::new(0));
     let (wok, wtotal) = (ok_count.clone(), total_count.clone());
@@ -140,14 +150,15 @@ async fn main() -> Result<()> {
             if result.ok {
                 wok.fetch_add(1, Ordering::Relaxed);
             }
-            let line = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-            buf.write_all(line.as_bytes()).await?;
-            buf.write_all(b"\n").await?;
-            // Batch flushes: per-line flush is a syscall per host and kills throughput.
-            since_flush += 1;
-            if since_flush >= 32 {
-                buf.flush().await?;
-                since_flush = 0;
+            if let Some(line) = render_result(&result, output_format)? {
+                buf.write_all(line.as_bytes()).await?;
+                buf.write_all(b"\n").await?;
+                // Batch flushes: per-line flush is a syscall per host and kills throughput.
+                since_flush += 1;
+                if since_flush >= 32 {
+                    buf.flush().await?;
+                    since_flush = 0;
+                }
             }
         }
         buf.flush().await?;
@@ -191,4 +202,28 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_only_flag_and_alias_parse() {
+        assert!(
+            Args::try_parse_from(["vedette", "--url-only"])
+                .unwrap()
+                .url_only
+        );
+        assert!(
+            Args::try_parse_from(["vedette", "--urls"])
+                .unwrap()
+                .url_only
+        );
+    }
+
+    #[test]
+    fn json_lines_remain_the_default() {
+        assert!(!Args::try_parse_from(["vedette"]).unwrap().url_only);
+    }
 }
