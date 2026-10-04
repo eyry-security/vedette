@@ -38,6 +38,9 @@ vedette -l hosts.txt -o results.jsonl
 # From stdin
 cat hosts.txt | vedette -o results.jsonl
 
+# Print only live final URLs, one per line
+foretop --scope example.com | vedette --url-only --silent
+
 # Stream from a Redis list (blocking BRPOP), runs until interrupted
 vedette --redis redis://127.0.0.1:6379 --queue vedette:hosts -o results.jsonl
 
@@ -60,7 +63,8 @@ timeout. Lines that are JSON objects with a `host` field (e.g. from
 | `-l, --list <FILE>` | – | Input file, one host per line |
 | `--redis <URL>` | – | Read hosts from a Redis list via `BRPOP` |
 | `--queue <KEY>` | `vedette:hosts` | Redis list key |
-| `-o, --output <FILE>` | stdout | Write JSONL results here |
+| `-o, --output <FILE>` | stdout | Write results here |
+| `--url-only` | off | Write only successful final URLs, one per line (`--urls` alias) |
 | `-c, --concurrency <N>` | `50` | Concurrent probes |
 | `-t, --timeout <SECS>` | `10` | Per-request timeout |
 | `--retries <N>` | `1` | Retries per scheme after the first attempt |
@@ -98,6 +102,14 @@ $ echo 'eyry.io' | vedette --silent
   "response_time_ms": 505,
   "timestamp": "2026-10-04T07:43:00Z"
 }
+```
+
+For URL pipelines, `--url-only` prints only the final URL of each successful
+probe and omits failed hosts. Redirect destinations are preserved:
+
+```sh
+$ printf 'eyry.io\noffline.invalid\n' | vedette --url-only --silent
+https://www.eyry.io/
 ```
 
 Notes:
@@ -153,7 +165,7 @@ and at scale — nothing downstream runs on guesses.
 - TLS certificate details (subject/issuer/SAN/expiry) as structured fields
 - Preserve request paths for full-URL inputs
 - Custom ports and port lists
-- Optional CSV / plain output
+- Optional CSV output
 
 ## License
 
