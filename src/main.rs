@@ -72,6 +72,52 @@ struct Args {
     silent: bool,
 }
 
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+async fn write_results<W>(
+    out: W,
+    mut res_rx: mpsc::Receiver<vedette::ProbeResult>,
+    ok_count: Arc<AtomicU64>,
+    total_count: Arc<AtomicU64>,
+    output_format: OutputFormat,
+    flush_every: Duration,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = BufWriter::new(out);
+    let mut since_flush = 0u32;
+    let mut flush_tick = tokio::time::interval(flush_every);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            result = res_rx.recv() => {
+                let Some(result) = result else { break };
+                total_count.fetch_add(1, Ordering::Relaxed);
+                if result.ok {
+                    ok_count.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(line) = render_result(&result, output_format)? {
+                    buf.write_all(line.as_bytes()).await?;
+                    buf.write_all(b"\n").await?;
+                    since_flush += 1;
+                    if since_flush >= 32 {
+                        buf.flush().await?;
+                        since_flush = 0;
+                    }
+                }
+            }
+            _ = flush_tick.tick(), if since_flush > 0 => {
+                buf.flush().await?;
+                since_flush = 0;
+            }
+        }
+    }
+    buf.flush().await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -143,26 +189,7 @@ async fn main() -> Result<()> {
             ),
             None => Box::new(tokio::io::stdout()),
         };
-        let mut buf = BufWriter::new(&mut out);
-        let mut since_flush = 0u32;
-        while let Some(result) = res_rx.recv().await {
-            wtotal.fetch_add(1, Ordering::Relaxed);
-            if result.ok {
-                wok.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(line) = render_result(&result, output_format)? {
-                buf.write_all(line.as_bytes()).await?;
-                buf.write_all(b"\n").await?;
-                // Batch flushes: per-line flush is a syscall per host and kills throughput.
-                since_flush += 1;
-                if since_flush >= 32 {
-                    buf.flush().await?;
-                    since_flush = 0;
-                }
-            }
-        }
-        buf.flush().await?;
-        Ok::<(), anyhow::Error>(())
+        write_results(out, res_rx, wok, wtotal, output_format, STREAM_FLUSH_INTERVAL).await
     });
 
     // Producer task feeds hosts into host_tx.
@@ -225,5 +252,42 @@ mod tests {
     #[test]
     fn json_lines_remain_the_default() {
         assert!(!Args::try_parse_from(["vedette"]).unwrap().url_only);
+    }
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn quiet_stream_flushes_before_result_channel_closes() {
+        let (writer_io, reader_io) = tokio::io::duplex(4096);
+        let (tx, rx) = mpsc::channel(1);
+        let ok_count = Arc::new(AtomicU64::new(0));
+        let total_count = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(write_results(
+            writer_io,
+            rx,
+            ok_count,
+            total_count.clone(),
+            OutputFormat::JsonLines,
+            Duration::from_millis(10),
+        ));
+
+        tx.send(vedette::ProbeResult::failed("quiet.test", "quiet.test", "test"))
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(reader_io);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_millis(250), reader.read_line(&mut line))
+            .await
+            .expect("quiet result was not flushed")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["host"],
+            "quiet.test"
+        );
+        assert_eq!(total_count.load(Ordering::Relaxed), 1);
+
+        drop(tx);
+        task.await.unwrap().unwrap();
     }
 }
