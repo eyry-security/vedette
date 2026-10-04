@@ -1,12 +1,22 @@
 # Vedette
 
-Fast, multi-threaded HTTP prober. The forward scout of the [Eyry](https://eyry.io) recon suite.
+Fast, multi-threaded HTTP prober. What's live, and what is it.
 
-Vedette takes a list or stream of hosts, probes `80`/`443` concurrently, and writes one JSON
-record per host. It is small, quick, and Unix-y: read from a file, stdin, or a Redis queue, and
-pipe the JSONL output into whatever comes next.
+Part of [Eyry](https://eyry.io) — a *vedette* is the forward scout, the picket
+boat sent ahead of the fleet.
 
-MIT licensed. Use it only against systems you are authorized to test.
+## What it does
+
+- Takes hosts from a file, stdin, or a Redis queue (streaming `BRPOP`) and
+  probes them concurrently (default 50).
+- For each host: status code, title, server header, tech fingerprint,
+  resolved IPs, body hash, response time.
+- Writes one JSON object per line (JSONL) — the shared host/service schema the
+  rest of the suite speaks, so output flows straight into a queue or scanner.
+- Dead hosts are still emitted, with `"ok": false` and an `error` field — so
+  nothing is silently dropped.
+
+MIT licensed. Use only against systems you are authorized to test.
 
 ## Install
 
@@ -16,6 +26,8 @@ cd vedette
 cargo build --release
 # binary at ./target/release/vedette
 ```
+
+Rust 1.70+ (2021 edition).
 
 ## Usage
 
@@ -34,10 +46,12 @@ vedette -l hosts.txt -c 200 -t 8 --https-only -o results.jsonl
 ```
 
 Inputs may be bare hosts (`admin.example.com`), `host:port`, or full URLs
-(`https://example.com`). For a bare host, Vedette tries `https` then `http` by default.
-Lines that are JSON objects with a `host` field (e.g. from `foretop --json`)
-have the host extracted automatically, so `foretop --scope example.com | vedette`
-and `foretop --scope example.com --json | vedette` both work.
+(`https://example.com`). For a bare host, Vedette probes `https` then `http`
+concurrently (https wins); http-only and dead hosts don't pay a second serial
+timeout. Lines that are JSON objects with a `host` field (e.g. from
+`foretop --json`) have the host extracted automatically, so
+`foretop --scope example.com | vedette` and
+`foretop --scope example.com --json | vedette` both work.
 
 ### Options
 
@@ -54,63 +68,86 @@ and `foretop --scope example.com --json | vedette` both work.
 | `--https-only` / `--http-only` | – | Restrict schemes |
 | `--silent` | – | Suppress the stderr summary |
 
+`vedette --version` prints the version.
+
 ## Output
 
-One JSON object per line (JSONL). This is the shared host/service schema the rest of the Eyry
-suite speaks, so Vedette output flows straight into a queue or scanner.
+One JSON object per line (JSONL). Real output from a single probe:
+
+```sh
+$ echo 'eyry.io' | vedette --silent
+```
 
 ```json
 {
-  "input": "www.eyry.io",
+  "input": "eyry.io",
   "ok": true,
   "url": "https://www.eyry.io/",
   "scheme": "https",
-  "host": "www.eyry.io",
+  "host": "eyry.io",
   "port": 443,
   "status": 200,
-  "title": "Eyry Cyber Security",
+  "title": "Eyry — The AppSec Pipeline: Build, Break, Harden, Watch",
   "server": "Vercel",
   "content_type": "text/html; charset=utf-8",
-  "content_length": 43777,
-  "ips": ["216.198.79.65", "64.29.17.65"],
-  "tech": ["Vercel", "Next.js", "React"],
-  "body_sha256": "c4aa86…",
-  "response_time_ms": 170,
-  "timestamp": "2026-08-03T01:50:06Z"
+  "content_length": 54185,
+  "redirects": 1,
+  "ips": ["216.198.79.1"],
+  "tech": ["Vercel", "Next.js"],
+  "body_sha256": "d9ae3dfd19aabbec6bdb1e4ff3f49ce787c1cce0f3046273f27767bdf57e055e",
+  "response_time_ms": 505,
+  "timestamp": "2026-10-04T07:43:00Z"
 }
 ```
 
-Hosts that do not respond are still emitted, with `"ok": false` and an `error` field, so nothing
-is silently dropped.
-
 Notes:
-- For a bare host, https and http are probed **concurrently** (https wins); http-only and dead
-  hosts don't pay a second serial timeout.
-- The body is streamed and cut off at `--max-body` (default 512 KB), so Vedette never downloads a
-  huge page. `body_sha256` and, when there is no `Content-Length` header, `content_length` reflect
-  the bytes actually read.
-- DNS uses a shared async resolver (public resolvers, both A and AAAA). A host that resolves to
-  nothing is reported immediately as failed without wasting HTTP attempts.
+
+- For a bare host, https and http are probed **concurrently** (https wins); the
+  scheme can also be pinned with `--https-only` / `--http-only`.
+- The body is streamed and cut off at `--max-body` (default 512 KB), so Vedette
+  never downloads a huge page. `body_sha256` and, when there is no
+  `Content-Length` header, `content_length` reflect the bytes actually read.
+- DNS uses a shared async resolver (public resolvers, both A and AAAA). A host
+  that resolves to nothing is reported immediately as failed without wasting
+  HTTP attempts.
 
 ## As a library
 
-```rust
-use vedette::{probe, ProbeOptions};
+The prober is usable from Rust code — not just the CLI:
 
-let client = reqwest::Client::new();
-let result = probe(&client, "example.com", &ProbeOptions::default()).await;
-println!("{}", serde_json::to_string(&result)?);
+```rust
+use std::sync::Arc;
+use vedette::{probe, ProbeOptions};
+use vedette::resolver::Dns;
+
+#[tokio::main]
+async fn main() {
+    let client = Arc::new(reqwest::Client::new());
+    let dns = Dns::new();
+    let result = probe(client, &dns, "example.com", &ProbeOptions::default()).await;
+    println!("{}", serde_json::to_string(&result).unwrap());
+}
 ```
 
 ## Where it fits
 
 ```
-Foretop (new hosts) → Purser (queue) → Vedette (probe + fingerprint) → Aplomado (AI review)
+Foretop (new hosts) → Purser (queue) → Vedette (probe) → Rutt (store) → Aplomado (AI review)
 ```
 
-Vedette is the first stage: confirm what is live and worth a closer look, fast. See the suite at
-[github.com/eyry-security](https://github.com/eyry-security).
+Vedette is the probe stage: it confirms what's alive and fingerprints it, fast
+and at scale — nothing downstream runs on guesses.
 
+## The Eyry suite
+
+- **eyry**: one CLI that wires the data plane together — discover → queue → probe → store
+- **vedette**: fast, multi-threaded HTTP prober (Rust) — confirms what is live and fingerprints it
+- **foretop**: pluggable live feed of new hosts, starting with Certificate Transparency logs
+- **purser**: Redis-backed priority work queue — hot/warm/cold lanes, retries, dead-letter queue
+- **rutt**: Postgres store for the host lifecycle (discovered → probed → reviewed) with an append-only scan log
+- **pinnace**: general multi-turn agent runtime — compaction, tools, Docker sandbox, resumable sessions
+- **aplomado**: AI security reviewer built on Pinnace — target in, structured findings out
+- **quarterdeck**: agent control plane — scheduler, wake/sleep, identity and memory, IRC-style chat, ChatOps, pipeline orchestration
 ## Roadmap
 
 - TLS certificate details (subject/issuer/SAN/expiry) as structured fields
@@ -121,3 +158,7 @@ Vedette is the first stage: confirm what is live and worth a closer look, fast. 
 ## License
 
 MIT © Eyry
+
+---
+
+Use only against systems you are authorized to test.
