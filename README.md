@@ -35,6 +35,9 @@ vedette -l hosts.txt -c 200 -t 8 --https-only -o results.jsonl
 
 Inputs may be bare hosts (`admin.example.com`), `host:port`, or full URLs
 (`https://example.com`). For a bare host, Vedette tries `https` then `http` by default.
+Lines that are JSON objects with a `host` field (e.g. from `foretop --json`)
+have the host extracted automatically, so `foretop --scope example.com | vedette`
+and `foretop --scope example.com --json | vedette` both work.
 
 ### Options
 

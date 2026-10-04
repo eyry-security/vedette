@@ -16,6 +16,26 @@ pub enum Source {
     Redis { url: String, queue: String },
 }
 
+/// Pull the hostname out of one input line.
+///
+/// Accepts bare hosts (`admin.example.com`), `host:port`, and full URLs — and,
+/// for piping from `foretop --json`, a JSON object carrying a `host` field
+/// (`{"host":"api.example.com",...}`), from which the host is extracted.
+fn extract_host(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(h) = v.get("host").and_then(|h| h.as_str()) {
+                let h = h.trim();
+                if !h.is_empty() {
+                    return h.to_string();
+                }
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Read hosts from a file or stdin, sending each non-empty, non-comment line.
 async fn produce_lines<R>(reader: R, tx: Sender<String>) -> Result<()>
 where
@@ -23,7 +43,7 @@ where
 {
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        let host = line.trim().to_string();
+        let host = extract_host(&line);
         if host.is_empty() || host.starts_with('#') {
             continue;
         }
@@ -79,5 +99,38 @@ pub async fn run(source: Source, tx: Sender<String>) -> Result<()> {
         }
         Source::Stdin => produce_lines(tokio::io::stdin(), tx).await,
         Source::Redis { url, queue } => produce_redis(&url, &queue, tx).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_host;
+
+    #[test]
+    fn bare_host_passes_through() {
+        assert_eq!(extract_host("admin.example.com"), "admin.example.com");
+        assert_eq!(extract_host("  admin.example.com  \n"), "admin.example.com");
+    }
+
+    #[test]
+    fn host_port_and_url_pass_through() {
+        assert_eq!(extract_host("example.com:8443"), "example.com:8443");
+        assert_eq!(
+            extract_host("https://example.com/path?q=1"),
+            "https://example.com/path?q=1"
+        );
+    }
+
+    #[test]
+    fn json_record_yields_host() {
+        let line = r#"{"host":"api.example.com","source":"certstream","scope":"*.example.com"}"#;
+        assert_eq!(extract_host(line), "api.example.com");
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_raw_line() {
+        assert_eq!(extract_host("{not json"), "{not json");
+        assert_eq!(extract_host("{}"), "{}");
+        assert_eq!(extract_host(r#"{"other":1}"#), r#"{"other":1}"#);
     }
 }
